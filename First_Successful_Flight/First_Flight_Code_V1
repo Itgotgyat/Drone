@@ -1,1 +1,1311 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include "SparkFunLSM6DS3.h"
+#include <Adafruit_VL53L0X.h>
+#include <ArduinoOTA.h>
+
+/*
+ * ESP32 quadcopter flight controller
+ *
+ * I2C (400 kHz): SDA on GPIO 15, SCL on GPIO 5. Shared by the LSM6DS3 IMU and the VL53L0X ToF sensor.
+ * SD card (SPI): CS 4, SCK 18, MOSI 14, MISO 27
+ * Motors: M1 on GPIO 19, M2 on GPIO 23, M3 on GPIO 32, M4 on GPIO 25
+ *
+ * An angle loop feeds a rate loop, and the mixer turns the result into four ESC pulses.
+ * A web page served over Wi-Fi handles control, telemetry, tuning and logging.
+ */
+
+// Set to 1 to calibrate the ESCs at boot. Props must be off. Set back to 0 afterwards.
+#define ESC_CAL_MODE 0
+
+// Set to 1 to print status to Serial at 10 Hz
+#define DEBUG_SERIAL 0
+
+// Set to 0 to use the library read functions instead of the burst read
+#define USE_BURST_IMU_READ 1
+
+// Pins
+const int SDA_PIN = 15;
+const int SCL_PIN = 5;
+
+const int SD_CS_PIN = 4;
+const int SD_SCK_PIN = 18;
+const int SD_MOSI_PIN = 14;
+const int SD_MISO_PIN = 27;
+
+const int MOTOR_1_PIN = 19; // front left, CCW
+const int MOTOR_2_PIN = 23; // rear left, CW
+const int MOTOR_3_PIN = 32; // rear right, CCW
+const int MOTOR_4_PIN = 25; // front right, CW
+
+// Height of the ToF sensor when the drone sits on the ground (mm)
+const float TARGET_GROUND_HEIGHT = 48.88;
+
+// ESC pulse limits (microseconds)
+const int MIN_THROTTLE = 1075;
+const int MAX_THROTTLE = 1750;
+const int DISARMED_PWM = 1000;
+
+// Tuning constants
+const int ESC_PWM_HZ = 250; // drop to 50 if the ESCs act up at higher rates
+const float GYRO_LPF_ALPHA = 0.55f; // weight of the new sample, about 45 Hz cutoff at 200 Hz
+const float ACCEL_LPF_ALPHA = 0.20f; // weight of the new sample
+const uint32_t CMD_TIMEOUT_MS = 1000; // not used anymore, the failsafe was removed
+const float I_OUT_LIMIT = 120.0f; // max integrator output for roll and pitch (us)
+const float YAW_I_OUT_LIMIT = 50.0f; // max integrator output for yaw (us)
+const float YAW_FEEDBACK_SIGN = 1.0f; // set to -1.0f if yaw correction pushes the wrong way
+const int MAX_UPSHIFT_US = 100; // max throttle lift when a motor would clip low
+
+LSM6DS3 myIMU(I2C_MODE, 0x6B);
+Adafruit_VL53L0X l0x = Adafruit_VL53L0X();
+
+Servo motor1;
+Servo motor2;
+Servo motor3;
+Servo motor4;
+
+const char* ssid = "ESP32_Drone_AP";
+const char* password = "FlightControl123";
+WebServer server(80);
+
+// State shared between the web side and the flight task
+volatile bool armed = false;
+volatile bool emergencyStop = false;
+volatile bool isLogging = false;
+
+volatile bool requestCalibration = false;
+volatile bool isCalibrating = false;
+volatile int calibrationProgress = 0;
+
+volatile uint32_t lastCmdMs = 0;
+volatile bool failsafeTripped = false;
+
+bool sdCardReady = false;
+uint64_t laptopTimeOffset = 0;
+
+// Commands received over Wi-Fi
+volatile float cmdRoll = 0.0;
+volatile float cmdPitch = 0.0;
+volatile float cmdYaw = 0.0;
+volatile float cmdThrottle = 0.0;
+
+// Level trim from the web page (degrees)
+volatile float trimRoll = 0.0f;
+volatile float trimPitch = 0.0f;
+
+// Sensor offsets found during calibration
+float accelBiasX = 0;
+float accelBiasY = 0;
+float accelBiasZ = 0;
+float gyroBiasX = 0;
+float gyroBiasY = 0;
+float gyroBiasZ = 0;
+float tofOffset = 0;
+
+// Values shown in telemetry
+volatile float rollAngle = 0.0;
+volatile float pitchAngle = 0.0;
+volatile float yawAngle = 0.0;
+volatile float curAx = 0.0;
+volatile float curAy = 0.0;
+volatile float curAz = 0.0;
+volatile float curGx = 0.0;
+volatile float curGy = 0.0;
+volatile float curGz = 0.0;
+volatile float filteredToF = TARGET_GROUND_HEIGHT;
+volatile float altitudeAGL = 0.0;
+
+// Copies of the motor outputs and loop time for debugging
+volatile int dbgM1 = 0;
+volatile int dbgM2 = 0;
+volatile int dbgM3 = 0;
+volatile int dbgM4 = 0;
+volatile uint32_t dbgLoopMaxUs = 0;
+
+// Filter memory
+float fGx = 0.0;
+float fGy = 0.0;
+float fGz = 0.0;
+float fAx = 0.0;
+float fAy = 0.0;
+float fAz = 1.0;
+float fRollD = 0.0;
+float fPitchD = 0.0;
+
+// One-axis Kalman filter for the tilt angle
+struct Kalman {
+  float Q_angle = 0.001f;
+  float Q_bias = 0.003f;
+  float R_measure = 0.5f; // overwritten every loop in the flight task
+  float angle = 0.0f;
+  float bias = 0.0f;
+  float P[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+
+  void reset() {
+    angle = 0.0f;
+    bias = 0.0f;
+    P[0][0] = 0.0f;
+    P[0][1] = 0.0f;
+    P[1][0] = 0.0f;
+    P[1][1] = 0.0f;
+  }
+
+  float update(float newAngle, float newRate, float dt, bool trustAccel) {
+    float rate = newRate - bias;
+    angle += dt * rate;
+
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += Q_bias * dt;
+
+    // Only correct with the accelerometer when its reading is believable
+    if (trustAccel) {
+      float S = P[0][0] + R_measure;
+      float K[2];
+      K[0] = P[0][0] / S;
+      K[1] = P[1][0] / S;
+
+      float y = newAngle - angle;
+      angle += K[0] * y;
+      bias += K[1] * y;
+
+      float P00_temp = P[0][0];
+      float P01_temp = P[0][1];
+
+      P[0][0] -= K[0] * P00_temp;
+      P[0][1] -= K[0] * P01_temp;
+      P[1][0] -= K[1] * P00_temp;
+      P[1][1] -= K[1] * P01_temp;
+    }
+
+    return angle;
+  }
+};
+
+Kalman kalmanRoll;
+Kalman kalmanPitch;
+
+struct PIDGains {
+  float kp;
+  float ki;
+  float kd;
+};
+
+// Outer angle loop gain, turns degrees of error into a deg/s target. Tunable over Wi-Fi.
+volatile float anglePGain = 4.5f;
+
+// Inner rate loop gains, output is in microseconds. Tunable over Wi-Fi.
+PIDGains rollRatePID = { 1.00f, 1.50f, 0.005f };
+PIDGains pitchRatePID = { 1.00f, 1.50f, 0.005f };
+PIDGains yawRatePID = { 1.00f, 0.20f, 0.000f };
+
+float rollI = 0.0f;
+float pitchI = 0.0f;
+float yawI = 0.0f;
+float prevRollRate = 0.0f;
+float prevPitchRate = 0.0f;
+
+struct LogFrame {
+  uint64_t timestamp;
+  float roll;
+  float pitch;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+  float tofDist;
+  int m1;
+  int m2;
+  int m3;
+  int m4;
+};
+
+QueueHandle_t logQueue;
+File logFile;
+
+const char HTML_CONTROLLER[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Flight Control & Telemetry</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; touch-action: none; margin: 0; padding: 10px; }
+        .top-bar { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+        .btn { padding: 10px 14px; font-size: 14px; font-weight: bold; border-radius: 6px; border: none; color: white; cursor: pointer; }
+        .btn-arm { background: #28a745; }
+        .btn-disarm { background: #6c757d; }
+        .btn-estop { background: #dc3545; font-size: 16px; width: 48%; margin: 5px 1%; }
+        .btn-reset-estop { background: #fd7e14; font-size: 16px; width: 48%; margin: 5px 1%; }
+        .btn-cal { background: #17a2b8; }
+        .btn-trim { background: #333; color: #00ffcc; font-weight: bold; padding: 6px 8px; font-size: 12px; margin: 2px; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
+        .btn-trim:active { background: #007bff; color: #fff; }
+
+        .controls-container { display: flex; justify-content: space-around; align-items: center; margin: 15px 0; }
+        .zone { width: 120px; height: 120px; background: #222; border: 2px solid #555; border-radius: 50%; position: relative; }
+        .stick { width: 40px; height: 40px; background: #007bff; border-radius: 50%; position: absolute; top: 40px; left: 40px; }
+
+        .slider-container { display: flex; flex-direction: column; align-items: center; height: 130px; justify-content: center; }
+        .slider-label { font-size: 12px; margin-bottom: 5px; color: #aaa; }
+        input[type=range][orient=vertical] {
+            appearance: slider-vertical;
+            width: 30px;
+            height: 100px;
+            background: #333;
+        }
+
+        .trim-box { background: #1e1e1e; border: 1px solid #333; border-radius: 8px; padding: 10px; margin: 10px 0; font-size: 12px; }
+        .telemetry-box { background: #1e1e1e; border: 1px solid #333; border-radius: 8px; padding: 10px; margin-top: 10px; font-family: monospace; font-size: 12px; text-align: left; }
+        .telemetry-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .telem-card { background: #2a2a2a; padding: 6px; border-radius: 4px; }
+        .telem-title { font-weight: bold; color: #ffc107; margin-bottom: 4px; }
+        #status { margin-bottom: 8px; font-size: 13px; color: #00ffcc; text-align: center; }
+    </style>
+</head>
+<body>
+    <div style="display: flex; justify-content: center;">
+        <button class="btn btn-estop" onclick="triggerEStop()">E-STOP</button>
+        <button class="btn btn-reset-estop" onclick="resetEStop()">RESET E-STOP</button>
+    </div>
+
+    <div class="top-bar">
+        <button id="armBtn" class="btn btn-disarm" onclick="toggleArm()">DISARMED</button>
+        <button class="btn btn-cal" onclick="startCalibration()">Calibrate</button>
+    </div>
+
+    <div class="controls-container">
+        <div class="slider-container">
+            <span class="slider-label">Throttle</span>
+            <input type="range" id="throttleSlider" min="0" max="1" step="0.01" value="0" orient="vertical" oninput="updateThrottle(this.value)">
+        </div>
+        <div>
+            <div id="leftZone" class="zone"><div id="leftStick" class="stick"></div></div>
+            <span style="font-size:11px; color:#888;">Pitch / Yaw</span>
+        </div>
+        <div>
+            <div id="rightZone" class="zone"><div id="rightStick" class="stick"></div></div>
+            <span style="font-size:11px; color:#888;">Roll</span>
+        </div>
+    </div>
+
+    <div class="trim-box">
+        <div style="font-weight:bold; color:#ffc107; margin-bottom:8px;">Fine Level Trim Adjustments</div>
+        <div style="margin-bottom:6px;">
+            Roll: 
+            <button class="btn-trim" onclick="adjustTrim('r', -0.5)">-0.5°</button>
+            <button class="btn-trim" onclick="adjustTrim('r', -0.1)">-0.1°</button>
+            <button class="btn-trim" onclick="adjustTrim('r', -0.01)">-0.01°</button>
+            <span id="disp_trim_r" style="color:#00ffcc; font-weight:bold; margin:0 4px; display:inline-block; min-width:45px;">0.00°</span>
+            <button class="btn-trim" onclick="adjustTrim('r', 0.01)">+0.01°</button>
+            <button class="btn-trim" onclick="adjustTrim('r', 0.1)">+0.1°</button>
+            <button class="btn-trim" onclick="adjustTrim('r', 0.5)">+0.5°</button>
+        </div>
+        <div>
+            Pitch: 
+            <button class="btn-trim" onclick="adjustTrim('p', -0.5)">-0.5°</button>
+            <button class="btn-trim" onclick="adjustTrim('p', -0.1)">-0.1°</button>
+            <button class="btn-trim" onclick="adjustTrim('p', -0.01)">-0.01°</button>
+            <span id="disp_trim_p" style="color:#00ffcc; font-weight:bold; margin:0 4px; display:inline-block; min-width:45px;">0.00°</span>
+            <button class="btn-trim" onclick="adjustTrim('p', 0.01)">+0.01°</button>
+            <button class="btn-trim" onclick="adjustTrim('p', 0.1)">+0.1°</button>
+            <button class="btn-trim" onclick="adjustTrim('p', 0.5)">+0.5°</button>
+        </div>
+    </div>
+
+    <div id="status">Status: Ready</div>
+
+    <div class="telemetry-box">
+        <div class="telemetry-grid">
+            <div class="telem-card">
+                <div class="telem-title">Motors (us)</div>
+                FL M1: <span id="t_m1">0</span> | FR M4: <span id="t_m4">0</span><br>
+                RL M2: <span id="t_m2">0</span> | RR M3: <span id="t_m3">0</span>
+            </div>
+            <div class="telem-card">
+                <div class="telem-title">Angles (deg)</div>
+                Roll: <span id="t_roll">0.0</span><br>
+                Pitch: <span id="t_pitch">0.0</span><br>
+                Yaw: <span id="t_yaw">0.0</span>
+            </div>
+            <div class="telem-card">
+                <div class="telem-title">Altitude</div>
+                Alt AGL: <span id="t_alt">0.0</span> mm<br>
+                ToF Range: <span id="t_tof">0.0</span> mm
+            </div>
+            <div class="telem-card">
+                <div class="telem-title">Accel (g)</div>
+                X: <span id="t_ax">0.00</span> | Y: <span id="t_ay">0.00</span><br>
+                Z: <span id="t_az">0.00</span>
+            </div>
+            <div class="telem-card">
+                <div class="telem-title">Gyro (deg/s)</div>
+                X: <span id="t_gx">0.00</span> | Y: <span id="t_gy">0.00</span><br>
+                Z: <span id="t_gz">0.00</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let isArmed = false;
+        let controlData = { throttle: 0, yaw: 0, pitch: 0, roll: 0 };
+        let curTrimR = 0.0;
+        let curTrimP = 0.0;
+        let isSendingCmd = false;
+        let isFetchingTelem = false;
+        let armGraceUntil = 0;
+
+        function updateStatus(msg) {
+            document.getElementById("status").innerText = "Status: " + msg;
+        }
+
+        function setArmedUI(state) {
+            isArmed = state;
+            let btn = document.getElementById("armBtn");
+            btn.innerText = state ? "ARMED" : "DISARMED";
+            btn.className = state ? "btn btn-arm" : "btn btn-disarm";
+        }
+
+        function updateThrottle(val) {
+            controlData.throttle = parseFloat(val);
+        }
+
+        function adjustTrim(axis, val) {
+            if (axis === 'r') {
+                curTrimR = parseFloat((curTrimR + val).toFixed(2));
+                document.getElementById("disp_trim_r").innerText = (curTrimR >= 0 ? "+" : "") + curTrimR.toFixed(2) + "°";
+            } else if (axis === 'p') {
+                curTrimP = parseFloat((curTrimP + val).toFixed(2));
+                document.getElementById("disp_trim_p").innerText = (curTrimP >= 0 ? "+" : "") + curTrimP.toFixed(2) + "°";
+            }
+            fetch(`/set_trim?r=${curTrimR.toFixed(2)}&p=${curTrimP.toFixed(2)}`);
+        }
+
+        function triggerEStop() {
+            fetch('/estop');
+            setArmedUI(false);
+            document.getElementById("throttleSlider").value = 0;
+            controlData.throttle = 0;
+            updateStatus("EMERGENCY STOP TRIGGERED");
+        }
+
+        function resetEStop() {
+            fetch('/clear_estop').then(() => {
+                updateStatus("E-Stop Cleared. Ready to Arm.");
+            });
+        }
+
+        function toggleArm() {
+            if (!isArmed) {
+                // Refuse to arm with throttle up
+                if (controlData.throttle > 0.02) {
+                    alert("Set throttle to zero before arming!");
+                    return;
+                }
+                controlData.roll = 0;
+                controlData.pitch = 0;
+                controlData.yaw = 0;
+                armGraceUntil = Date.now() + 1500;
+                setArmedUI(true);
+                fetch('/cmd?arm=1');
+            } else {
+                setArmedUI(false);
+                document.getElementById("throttleSlider").value = 0;
+                controlData.throttle = 0;
+                fetch('/cmd?arm=0');
+            }
+        }
+
+        function startCalibration() {
+            if (isArmed) {
+                alert("Disarm the drone before calibrating!");
+                return;
+            }
+            updateStatus("Initiating fast calibration...");
+            fetch('/start_calibrate').then(r => r.text()).then(txt => {
+                if (txt === "STARTED") {
+                    pollCalibration();
+                } else {
+                    updateStatus("Calibration failed to start: " + txt);
+                }
+            });
+        }
+
+        function pollCalibration() {
+            let interval = setInterval(() => {
+                fetch('/calibrate_status').then(r => r.json()).then(data => {
+                    if (data.status === "RUNNING") {
+                        updateStatus(`Calibrating... Keep flat & still (${data.progress}%)`);
+                    } else if (data.status === "DONE") {
+                        clearInterval(interval);
+                        updateStatus("Calibration Successful!");
+                    } else if (data.status === "ERROR") {
+                        clearInterval(interval);
+                        updateStatus("Calibration Error: Cannot calibrate while armed.");
+                    }
+                }).catch(() => {});
+            }, 200);
+        }
+
+        function setupJoystick(zoneId, stickId, onMove, onRelease) {
+            let zone = document.getElementById(zoneId);
+            let stick = document.getElementById(stickId);
+            let active = false;
+
+            function handleMove(e) {
+                if (!active) return;
+                let rect = zone.getBoundingClientRect();
+                let centerX = rect.left + rect.width / 2;
+                let centerY = rect.top + rect.height / 2;
+                let touch = e.touches ? e.touches[0] : e;
+                let dx = touch.clientX - centerX;
+                let dy = touch.clientY - centerY;
+                let dist = Math.min(Math.hypot(dx, dy), 40);
+                let angle = Math.atan2(dy, dx);
+                let x = dist * Math.cos(angle);
+                let y = dist * Math.sin(angle);
+
+                stick.style.transform = `translate(${x}px, ${y}px)`;
+                onMove(x / 40, -y / 40);
+            }
+
+            zone.addEventListener('touchstart', (e) => {
+                active = true;
+                handleMove(e);
+            });
+            window.addEventListener('touchmove', handleMove);
+            window.addEventListener('touchend', () => {
+                active = false;
+                stick.style.transform = `translate(0px, 0px)`;
+                onRelease();
+            });
+        }
+
+        setupJoystick('leftZone', 'leftStick',
+            (x, y) => {
+                controlData.yaw = x;
+                controlData.pitch = y;
+            },
+            () => {
+                controlData.yaw = 0;
+                controlData.pitch = 0;
+            }
+        );
+
+        setupJoystick('rightZone', 'rightStick',
+            (x, y) => {
+                controlData.roll = x;
+            },
+            () => {
+                controlData.roll = 0;
+            }
+        );
+
+        // Send flight commands every 80 ms while armed
+        setInterval(() => {
+            if (isArmed && !isSendingCmd) {
+                isSendingCmd = true;
+                fetch(`/cmd?t=${controlData.throttle.toFixed(2)}&r=${controlData.roll.toFixed(2)}&p=${controlData.pitch.toFixed(2)}&y=${controlData.yaw.toFixed(2)}`)
+                    .finally(() => {
+                        isSendingCmd = false;
+                    });
+            }
+        }, 80);
+
+        // Poll telemetry every 200 ms and sync the armed state with the drone
+        setInterval(() => {
+            if (!isFetchingTelem) {
+                isFetchingTelem = true;
+                fetch('/telemetry')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('t_roll').innerText = data.roll.toFixed(1);
+                        document.getElementById('t_pitch').innerText = data.pitch.toFixed(1);
+                        document.getElementById('t_yaw').innerText = data.yaw.toFixed(1);
+                        document.getElementById('t_alt').innerText = data.alt.toFixed(1);
+                        document.getElementById('t_tof').innerText = data.tof.toFixed(1);
+                        document.getElementById('t_ax').innerText = data.ax.toFixed(2);
+                        document.getElementById('t_ay').innerText = data.ay.toFixed(2);
+                        document.getElementById('t_az').innerText = data.az.toFixed(2);
+                        document.getElementById('t_gx').innerText = data.gx.toFixed(1);
+                        document.getElementById('t_gy').innerText = data.gy.toFixed(1);
+                        document.getElementById('t_gz').innerText = data.gz.toFixed(1);
+                        document.getElementById('t_m1').innerText = data.m1;
+                        document.getElementById('t_m2').innerText = data.m2;
+                        document.getElementById('t_m3').innerText = data.m3;
+                        document.getElementById('t_m4').innerText = data.m4;
+
+                        if (data.armed === 0 && isArmed && Date.now() > armGraceUntil) {
+                            setArmedUI(false);
+                            document.getElementById("throttleSlider").value = 0;
+                            controlData.throttle = 0;
+                            updateStatus(data.failsafe === 1 ? "FAILSAFE: command link lost, disarmed" : "Disarmed by drone");
+                        }
+                    })
+                    .catch(() => {})
+                    .finally(() => {
+                        isFetchingTelem = false;
+                    });
+            }
+        }, 200);
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void calibrateSensors();
+void flightControlTask(void *pvParameters);
+void stopMotors();
+void resetEstimator();
+
+// Reads gyro and accel in one 12 byte burst.
+// Returns gyro in deg/s and accel in g, in the sensor frame with no bias removed.
+bool readIMU(float &gx, float &gy, float &gz, float &ax, float &ay, float &az) {
+#if USE_BURST_IMU_READ
+  uint8_t buf[12];
+  if (myIMU.readRegisterRegion(buf, LSM6DS3_ACC_GYRO_OUTX_L_G, 12) != IMU_SUCCESS) {
+    return false;
+  }
+
+  int16_t rgx = (int16_t)((buf[1] << 8) | buf[0]);
+  int16_t rgy = (int16_t)((buf[3] << 8) | buf[2]);
+  int16_t rgz = (int16_t)((buf[5] << 8) | buf[4]);
+  int16_t rax = (int16_t)((buf[7] << 8) | buf[6]);
+  int16_t ray = (int16_t)((buf[9] << 8) | buf[8]);
+  int16_t raz = (int16_t)((buf[11] << 8) | buf[10]);
+
+  gx = myIMU.calcGyro(rgx);
+  gy = myIMU.calcGyro(rgy);
+  gz = myIMU.calcGyro(rgz);
+  ax = myIMU.calcAccel(rax);
+  ay = myIMU.calcAccel(ray);
+  az = myIMU.calcAccel(raz);
+  return true;
+#else
+  gx = myIMU.readFloatGyroX();
+  gy = myIMU.readFloatGyroY();
+  gz = myIMU.readFloatGyroZ();
+  ax = myIMU.readFloatAccelX();
+  ay = myIMU.readFloatAccelY();
+  az = myIMU.readFloatAccelZ();
+  return true;
+#endif
+}
+
+static float clampf(float v, float lo, float hi) {
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
+
+  // Start the ESC signal first so they stop beeping
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  motor1.setPeriodHertz(ESC_PWM_HZ);
+  motor2.setPeriodHertz(ESC_PWM_HZ);
+  motor3.setPeriodHertz(ESC_PWM_HZ);
+  motor4.setPeriodHertz(ESC_PWM_HZ);
+
+  motor1.attach(MOTOR_1_PIN, 1000, 2000);
+  motor2.attach(MOTOR_2_PIN, 1000, 2000);
+  motor3.attach(MOTOR_3_PIN, 1000, 2000);
+  motor4.attach(MOTOR_4_PIN, 1000, 2000);
+
+  stopMotors();
+
+  Serial.println("ESCs idle (1000us).");
+
+#if ESC_CAL_MODE
+  // ESC calibration: full throttle first, then minimum. Props must be off.
+  motor1.writeMicroseconds(2000);
+  motor2.writeMicroseconds(2000);
+  motor3.writeMicroseconds(2000);
+  motor4.writeMicroseconds(2000);
+  delay(6000);
+
+  motor1.writeMicroseconds(1000);
+  motor2.writeMicroseconds(1000);
+  motor3.writeMicroseconds(1000);
+  motor4.writeMicroseconds(1000);
+  delay(6000);
+#endif
+
+  // Start Wi-Fi early so the access point is up even if a sensor fails
+  WiFi.softAP(ssid, password);
+  Serial.print("AP up at ");
+  Serial.println(WiFi.softAPIP());
+
+  // Wireless code upload
+  ArduinoOTA.setHostname("drone");
+  ArduinoOTA.onStart([]() {
+    armed = false;
+    stopMotors();
+  });
+  ArduinoOTA.begin();
+
+  // Sensors. Report a failure but keep going.
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  myIMU.settings.gyroEnabled = 1;
+  myIMU.settings.gyroRange = 2000; // dps
+  myIMU.settings.gyroSampleRate = 416; // Hz
+  myIMU.settings.accelEnabled = 1;
+  myIMU.settings.accelRange = 8; // g
+  myIMU.settings.accelSampleRate = 416; // Hz
+
+  bool imuOk = (myIMU.begin() == 0);
+  bool tofOk = l0x.begin(0x29, false, &Wire);
+
+  if (!imuOk) {
+    Serial.println("LSM6DS3 init FAILED - flight task will NOT start");
+  }
+  if (!tofOk) {
+    Serial.println("VL53L0X init FAILED - altitude data unavailable");
+  }
+
+  if (tofOk) {
+    l0x.setMeasurementTimingBudgetMicroSeconds(30000);
+    l0x.startRangeContinuous();
+  }
+
+  // SD card
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (SD.begin(SD_CS_PIN, SPI, 20000000)) {
+    sdCardReady = true;
+    logFile = SD.open("/flight_log.csv", FILE_APPEND);
+    if (logFile && logFile.size() == 0) {
+      logFile.println("timestamp_ms,roll,pitch,yaw,gyroX,gyroY,gyroZ,accelX,accelY,accelZ,tof_mm,alt_mm,m1,m2,m3,m4");
+      logFile.flush();
+    }
+    Serial.println("SD ready.");
+  } else {
+    Serial.println("SD init failed (logging disabled).");
+  }
+
+  logQueue = xQueueCreate(200, sizeof(LogFrame));
+
+  // Only calibrate and start flying if the IMU works
+  if (imuOk) {
+    calibrateSensors();
+
+    // Runs on core 1 at a higher priority than loop(), which is priority 1
+    xTaskCreatePinnedToCore(
+      flightControlTask,
+      "FlightLoop",
+      8192,
+      NULL,
+      10,
+      NULL,
+      1
+    );
+  }
+
+  // Web routes
+  server.on("/", []() {
+    server.send(200, "text/html", HTML_CONTROLLER);
+  });
+
+  server.on("/estop", []() {
+    emergencyStop = true;
+    armed = false;
+    cmdThrottle = 0;
+    cmdRoll = 0;
+    cmdPitch = 0;
+    cmdYaw = 0;
+    stopMotors();
+    server.send(200, "text/plain", "ESTOP_TRIGGERED");
+  });
+
+  server.on("/clear_estop", []() {
+    emergencyStop = false;
+    server.send(200, "text/plain", "ESTOP_CLEARED");
+  });
+
+  server.on("/start_calibrate", []() {
+    if (!armed) {
+      requestCalibration = true;
+      server.send(200, "text/plain", "STARTED");
+    } else {
+      server.send(400, "text/plain", "CANNOT_CALIBRATE_WHILE_ARMED");
+    }
+  });
+
+  server.on("/calibrate_status", []() {
+    String json = "{";
+    if (isCalibrating) {
+      json += "\"status\":\"RUNNING\",\"progress\":" + String(calibrationProgress);
+    } else if (requestCalibration) {
+      json += "\"status\":\"RUNNING\",\"progress\":0";
+    } else {
+      json += "\"status\":\"DONE\",\"progress\":100";
+    }
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/set_trim", []() {
+    if (server.hasArg("r")) {
+      trimRoll = server.arg("r").toFloat();
+    }
+    if (server.hasArg("p")) {
+      trimPitch = server.arg("p").toFloat();
+    }
+    server.send(200, "text/plain", "TRIM_UPDATED");
+  });
+
+  // Change gains without reflashing, only while disarmed. Example:
+  //   http://192.168.4.1/set_gains?ap=3.5&rp=0.8&ri=0.6&rd=0.004&yp=1.0&yi=0.2
+  // ap is the angle P gain. rp, ri and rd are the roll and pitch rate P, I and D.
+  // yp and yi are the yaw rate P and I.
+  server.on("/set_gains", []() {
+    if (armed) {
+      server.send(400, "text/plain", "DISARM_FIRST");
+      return;
+    }
+
+    if (server.hasArg("ap")) {
+      anglePGain = clampf(server.arg("ap").toFloat(), 0.0f, 10.0f);
+    }
+
+    if (server.hasArg("rp")) {
+      float v = clampf(server.arg("rp").toFloat(), 0.0f, 3.0f);
+      rollRatePID.kp = v;
+      pitchRatePID.kp = v;
+    }
+
+    if (server.hasArg("ri")) {
+      float v = clampf(server.arg("ri").toFloat(), 0.0f, 5.0f);
+      rollRatePID.ki = v;
+      pitchRatePID.ki = v;
+    }
+
+    if (server.hasArg("rd")) {
+      float v = clampf(server.arg("rd").toFloat(), 0.0f, 0.05f);
+      rollRatePID.kd = v;
+      pitchRatePID.kd = v;
+    }
+
+    if (server.hasArg("yp")) {
+      yawRatePID.kp = clampf(server.arg("yp").toFloat(), 0.0f, 3.0f);
+    }
+
+    if (server.hasArg("yi")) {
+      yawRatePID.ki = clampf(server.arg("yi").toFloat(), 0.0f, 3.0f);
+    }
+
+    server.send(200, "text/plain", "GAINS_UPDATED");
+  });
+
+  server.on("/gains", []() {
+    String json = "{";
+    json += "\"ap\":" + String((float)anglePGain, 3) + ",";
+    json += "\"rp\":" + String(rollRatePID.kp, 3) + ",";
+    json += "\"ri\":" + String(rollRatePID.ki, 3) + ",";
+    json += "\"rd\":" + String(rollRatePID.kd, 4) + ",";
+    json += "\"yp\":" + String(yawRatePID.kp, 3) + ",";
+    json += "\"yi\":" + String(yawRatePID.ki, 3);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/telemetry", []() {
+    String json = "{";
+    json += "\"roll\":" + String(rollAngle, 1) + ",";
+    json += "\"pitch\":" + String(pitchAngle, 1) + ",";
+    json += "\"yaw\":" + String(yawAngle, 1) + ",";
+    json += "\"tof\":" + String(filteredToF, 1) + ",";
+    json += "\"alt\":" + String(altitudeAGL, 1) + ",";
+    json += "\"ax\":" + String(curAx, 2) + ",";
+    json += "\"ay\":" + String(curAy, 2) + ",";
+    json += "\"az\":" + String(curAz, 2) + ",";
+    json += "\"gx\":" + String(curGx, 1) + ",";
+    json += "\"gy\":" + String(curGy, 1) + ",";
+    json += "\"gz\":" + String(curGz, 1) + ",";
+    json += "\"up\":" + String(millis()) + ",";
+    json += "\"m1\":" + String((int)dbgM1) + ",";
+    json += "\"m2\":" + String((int)dbgM2) + ",";
+    json += "\"m3\":" + String((int)dbgM3) + ",";
+    json += "\"m4\":" + String((int)dbgM4) + ",";
+    json += "\"armed\":" + String(armed ? 1 : 0) + ",";
+    json += "\"failsafe\":" + String(failsafeTripped ? 1 : 0);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/start_logging", []() {
+    if (server.hasArg("time")) {
+      uint64_t laptopTime = strtoull(server.arg("time").c_str(), NULL, 10);
+      laptopTimeOffset = laptopTime - millis();
+    }
+    isLogging = true;
+    server.send(200, "text/plain", "LOGGING_STARTED");
+  });
+
+  server.on("/stop_logging", []() {
+    isLogging = false;
+    if (logFile) {
+      logFile.flush();
+    }
+    server.send(200, "text/plain", "LOGGING_STOPPED");
+  });
+
+  server.on("/cmd", []() {
+    lastCmdMs = millis();
+
+    if (server.hasArg("arm")) {
+      bool armReq = (server.arg("arm").toInt() == 1);
+
+      // Zero the commands on every arm or disarm
+      cmdThrottle = 0;
+      cmdRoll = 0;
+      cmdPitch = 0;
+      cmdYaw = 0;
+
+      if (armReq && !emergencyStop) {
+        failsafeTripped = false;
+        armed = true;
+      } else if (!armReq) {
+        armed = false;
+      }
+    }
+
+    if (armed) {
+      if (server.hasArg("t")) {
+        cmdThrottle = clampf(server.arg("t").toFloat(), 0.0f, 1.0f);
+      }
+      if (server.hasArg("r")) {
+        cmdRoll = clampf(server.arg("r").toFloat(), -1.0f, 1.0f);
+      }
+      if (server.hasArg("p")) {
+        cmdPitch = clampf(server.arg("p").toFloat(), -1.0f, 1.0f);
+      }
+      if (server.hasArg("y")) {
+        cmdYaw = clampf(server.arg("y").toFloat(), -1.0f, 1.0f);
+      }
+    }
+
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+  Serial.println("Flight controller initialized.");
+}
+
+void stopMotors() {
+  motor1.writeMicroseconds(DISARMED_PWM);
+  motor2.writeMicroseconds(DISARMED_PWM);
+  motor3.writeMicroseconds(DISARMED_PWM);
+  motor4.writeMicroseconds(DISARMED_PWM);
+}
+
+// Clears the filters and estimator, used after calibration
+void resetEstimator() {
+  fGx = 0.0f;
+  fGy = 0.0f;
+  fGz = 0.0f;
+
+  fAx = 0.0f;
+  fAy = 0.0f;
+  fAz = 1.0f;
+
+  fRollD = 0.0f;
+  fPitchD = 0.0f;
+
+  prevRollRate = 0.0f;
+  prevPitchRate = 0.0f;
+
+  rollI = 0.0f;
+  pitchI = 0.0f;
+  yawI = 0.0f;
+
+  kalmanRoll.reset();
+  kalmanPitch.reset();
+}
+
+// Arduino loop task. Handles the web server, OTA, calibration requests and SD writes.
+void loop() {
+  server.handleClient();
+  ArduinoOTA.handle();
+
+  if (requestCalibration && !armed) {
+    requestCalibration = false;
+    calibrateSensors();
+  }
+
+  if (sdCardReady && logFile && isLogging) {
+    LogFrame frame;
+    while (xQueueReceive(logQueue, &frame, 0) == pdTRUE) {
+      logFile.printf("%llu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%d,%d,%d,%d\n",
+        frame.timestamp, frame.roll, frame.pitch, yawAngle,
+        frame.gyroX, frame.gyroY, frame.gyroZ,
+        curAx, curAy, curAz,
+        frame.tofDist, altitudeAGL,
+        frame.m1, frame.m2, frame.m3, frame.m4
+      );
+    }
+
+    static uint32_t lastFlush = 0;
+    if (millis() - lastFlush > 500) {
+      logFile.flush();
+      lastFlush = millis();
+    }
+  }
+
+#if DEBUG_SERIAL
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint > 100) {
+    lastPrint = millis();
+    Serial.printf("armed:%d thr:%.2f | roll:%.1f pitch:%.1f | gx:%.1f gy:%.1f gz:%.1f | M1:%d M2:%d M3:%d M4:%d | loopMax:%luus\n",
+      (int)armed, (float)cmdThrottle, (float)rollAngle, (float)pitchAngle,
+      (float)curGx, (float)curGy, (float)curGz,
+      (int)dbgM1, (int)dbgM2, (int)dbgM3, (int)dbgM4,
+      (unsigned long)dbgLoopMaxUs);
+    dbgLoopMaxUs = 0;
+  }
+#endif
+
+  // Give the idle task time to run
+  delay(1);
+}
+
+// Flight task. Runs on core 1 at priority 10, 200 Hz.
+void flightControlTask(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(5);
+  uint32_t lastUs = micros();
+  uint8_t imuFails = 0;
+
+  while (1) {
+    vTaskDelayUntil(&xLastWakeTime, period);
+
+    // Sit idle while calibrating
+    if (isCalibrating) {
+      stopMotors();
+      lastUs = micros();
+      vTaskDelay(pdMS_TO_TICKS(10));
+      xLastWakeTime = xTaskGetTickCount(); // resync so the delay doesn't try to catch up
+      continue;
+    }
+
+    uint32_t nowUs = micros();
+    float dt = (nowUs - lastUs) * 1e-6f;
+    lastUs = nowUs;
+    dt = constrain(dt, 0.002f, 0.020f);
+
+    // Read the IMU
+    float sGx;
+    float sGy;
+    float sGz;
+    float sAx;
+    float sAy;
+    float sAz;
+
+    if (!readIMU(sGx, sGy, sGz, sAx, sAy, sAz)) {
+      if (++imuFails > 10) {
+        armed = false;
+        stopMotors();
+      }
+      continue;
+    }
+    imuFails = 0;
+
+    float rawGx = sGx - gyroBiasX;
+    float rawGy = sGy - gyroBiasY;
+    float rawGz = sGz - gyroBiasZ;
+
+    float rawAx = sAx - accelBiasX;
+    float rawAy = sAy - accelBiasY;
+    float rawAz = sAz - accelBiasZ;
+
+    // Gyro low-pass, about 45 Hz cutoff at 200 Hz
+    fGx += GYRO_LPF_ALPHA * (rawGx - fGx);
+    fGy += GYRO_LPF_ALPHA * (rawGy - fGy);
+    fGz += GYRO_LPF_ALPHA * (rawGz - fGz);
+
+    // Remap the axes because the board is rotated 90 degrees clockwise
+    curAx = rawAy;
+    curAy = -rawAx;
+    curAz = rawAz;
+
+    curGx = -fGy; // roll rate
+    curGy = fGx; // pitch rate
+    curGz = fGz; // yaw rate
+
+    // Accel low-pass
+    fAx += ACCEL_LPF_ALPHA * (curAx - fAx);
+    fAy += ACCEL_LPF_ALPHA * (curAy - fAy);
+    fAz += ACCEL_LPF_ALPHA * (curAz - fAz);
+
+    // Angle estimate
+    float accelRoll = atan2(fAy, fAz) * 57.2958f;
+    float accelPitch = atan2(-fAx, sqrt(fAy * fAy + fAz * fAz)) * 57.2958f;
+
+    // Ignore the accelerometer when total g is far from 1
+    float totalG = sqrt(fAx * fAx + fAy * fAy + fAz * fAz);
+    bool trustAccel = (totalG > 0.82f && totalG < 1.18f);
+
+    // Trust the accelerometer much less once the throttle is up
+    float rMeas = (armed && cmdThrottle >= 0.10f) ? 100.0f : 0.5f;
+    kalmanRoll.R_measure = rMeas;
+    kalmanPitch.R_measure = rMeas;
+
+    rollAngle = kalmanRoll.update(accelRoll, curGx, dt, trustAccel);
+    pitchAngle = kalmanPitch.update(accelPitch, curGy, dt, trustAccel);
+    yawAngle += curGz * dt;
+
+    // Read the ToF sensor without blocking
+    if (l0x.isRangeComplete()) {
+      uint16_t distMm = l0x.readRange();
+      if (distMm > 10 && distMm < 1200) {
+        float rawMm = (float)distMm + tofOffset;
+        filteredToF = (0.15f * rawMm) + (0.85f * filteredToF);
+        altitudeAGL = max(0.0f, filteredToF - TARGET_GROUND_HEIGHT);
+      }
+    }
+
+    // Command-loss failsafe removed
+
+    // Motors off and estimator held while disarmed or in e-stop
+    if (!armed || emergencyStop) {
+      stopMotors();
+
+      kalmanRoll.angle = accelRoll;
+      kalmanPitch.angle = accelPitch;
+      yawAngle = 0.0f;
+
+      rollI = 0.0f;
+      pitchI = 0.0f;
+      yawI = 0.0f;
+
+      prevRollRate = curGx;
+      prevPitchRate = curGy;
+      fRollD = 0.0f;
+      fPitchD = 0.0f;
+
+      dbgM1 = DISARMED_PWM;
+      dbgM2 = DISARMED_PWM;
+      dbgM3 = DISARMED_PWM;
+      dbgM4 = DISARMED_PWM;
+      continue;
+    }
+
+    // Below this throttle the drone is treated as still on the ground
+    float thr = (float)cmdThrottle;
+    bool onGround = (thr < 0.40f);
+    if (onGround) {
+      kalmanRoll.angle = accelRoll;
+      kalmanPitch.angle = accelPitch;
+      yawAngle = 0.0f;
+
+      rollI = 0.0f;
+      pitchI = 0.0f;
+      yawI = 0.0f;
+
+      prevRollRate = curGx;
+      prevPitchRate = curGy;
+      fRollD = 0.0f;
+      fPitchD = 0.0f;
+    }
+
+    // Setpoints
+    float targetRollAngle = ((float)cmdRoll * 12.0f) + trimRoll;
+    float targetPitchAngle = (-(float)cmdPitch * 12.0f) + trimPitch;
+    float targetYawRate = (float)cmdYaw * 40.0f;
+
+    float aP = anglePGain;
+
+    // Roll
+    float rollAngleError = targetRollAngle - rollAngle;
+    float targetRollRate = rollAngleError * aP;
+    float rollRateError = targetRollRate - curGx;
+
+    float rollILim = I_OUT_LIMIT / max(rollRatePID.ki, 0.001f);
+    rollI += rollRateError * dt;
+    rollI = constrain(rollI, -rollILim, rollILim);
+
+    // D term uses the gyro, not the error, so setpoint changes don't kick it
+    float rollGyroDot = (curGx - prevRollRate) / dt;
+    fRollD = 0.60f * fRollD + 0.40f * rollGyroDot;
+    prevRollRate = curGx;
+
+    float rollOutput = (rollRatePID.kp * rollRateError) + (rollRatePID.ki * rollI) - (rollRatePID.kd * fRollD);
+
+    // Pitch
+    float pitchAngleError = targetPitchAngle - pitchAngle;
+    float targetPitchRate = pitchAngleError * aP;
+    float pitchRateError = targetPitchRate - curGy;
+
+    float pitchILim = I_OUT_LIMIT / max(pitchRatePID.ki, 0.001f);
+    pitchI += pitchRateError * dt;
+    pitchI = constrain(pitchI, -pitchILim, pitchILim);
+
+    float pitchGyroDot = (curGy - prevPitchRate) / dt;
+    fPitchD = 0.60f * fPitchD + 0.40f * pitchGyroDot;
+    prevPitchRate = curGy;
+
+    float pitchOutput = (pitchRatePID.kp * pitchRateError) + (pitchRatePID.ki * pitchI) - (pitchRatePID.kd * fPitchD);
+
+    // Yaw
+    float yawRateError = targetYawRate - curGz;
+
+    float yawILim = YAW_I_OUT_LIMIT / max(yawRatePID.ki, 0.001f);
+    yawI += yawRateError * dt;
+    yawI = constrain(yawI, -yawILim, yawILim);
+
+    float yawOutput = YAW_FEEDBACK_SIGN * ((yawRatePID.kp * yawRateError) + (yawRatePID.ki * yawI));
+
+    // Limit how much each axis can change the motors
+    rollOutput = constrain(rollOutput, -180.0f, 180.0f);
+    pitchOutput = constrain(pitchOutput, -180.0f, 180.0f);
+    yawOutput = constrain(yawOutput, -80.0f, 80.0f);
+
+    // Mixer
+    float cappedThrottle = constrain(thr, 0.0f, 0.88f);
+    int throttlePWM = MIN_THROTTLE + (int)(cappedThrottle * (MAX_THROTTLE - MIN_THROTTLE));
+
+    int o1 = (int)rollOutput + (int)pitchOutput + (int)yawOutput; // M1, front left, CCW
+    int o2 = (int)rollOutput - (int)pitchOutput - (int)yawOutput; // M2, rear left, CW
+    int o3 = -(int)rollOutput - (int)pitchOutput + (int)yawOutput; // M3, rear right, CCW
+    int o4 = -(int)rollOutput + (int)pitchOutput - (int)yawOutput; // M4, front right, CW
+
+    int hi = max(max(o1, o2), max(o3, o4));
+    int lo = min(min(o1, o2), min(o3, o4));
+
+    // If a motor would clip, shift all four together so the differences stay intact
+    int base = throttlePWM;
+    int overshootHi = (base + hi) - MAX_THROTTLE;
+    int overshootLo = MIN_THROTTLE - (base + lo);
+
+    if (overshootHi > 0 && overshootLo <= 0) {
+      base -= overshootHi;
+    } else if (overshootLo > 0 && overshootHi <= 0 && !onGround) {
+      base += min(overshootLo, MAX_UPSHIFT_US);
+    }
+
+    int m1 = constrain(base + o1, MIN_THROTTLE, MAX_THROTTLE);
+    int m2 = constrain(base + o2, MIN_THROTTLE, MAX_THROTTLE);
+    int m3 = constrain(base + o3, MIN_THROTTLE, MAX_THROTTLE);
+    int m4 = constrain(base + o4, MIN_THROTTLE, MAX_THROTTLE);
+
+    motor1.writeMicroseconds(m1);
+    motor2.writeMicroseconds(m2);
+    motor3.writeMicroseconds(m3);
+    motor4.writeMicroseconds(m4);
+
+    dbgM1 = m1;
+    dbgM2 = m2;
+    dbgM3 = m3;
+    dbgM4 = m4;
+
+    if (isLogging) {
+      LogFrame frame = {
+        millis() + laptopTimeOffset,
+        rollAngle, pitchAngle,
+        curGx, curGy, curGz,
+        filteredToF,
+        m1, m2, m3, m4
+      };
+      xQueueSend(logQueue, &frame, 0);
+    }
+
+    uint32_t elapsed = micros() - nowUs;
+    if (elapsed > dbgLoopMaxUs) {
+      dbgLoopMaxUs = elapsed;
+    }
+  }
+}
+
+// Sensor calibration. The drone must be level and still.
+void calibrateSensors() {
+  isCalibrating = true;
+  stopMotors();
+
+  // Let the flight task finish its current pass and go idle
+  delay(100);
+
+  calibrationProgress = 0;
+
+  const int numSamples = 250;
+  float aSumX = 0;
+  float aSumY = 0;
+  float aSumZ = 0;
+  float gSumX = 0;
+  float gSumY = 0;
+  float gSumZ = 0;
+  int good = 0;
+
+  for (int i = 0; i < numSamples; i++) {
+    float gx;
+    float gy;
+    float gz;
+    float ax;
+    float ay;
+    float az;
+
+    if (readIMU(gx, gy, gz, ax, ay, az)) {
+      aSumX += ax;
+      aSumY += ay;
+      aSumZ += az;
+      gSumX += gx;
+      gSumY += gy;
+      gSumZ += gz;
+      good++;
+    }
+
+    if (i % 5 == 0) {
+      calibrationProgress = (i * 85) / numSamples;
+      server.handleClient();
+    }
+    delay(5);
+  }
+
+  if (good > 0) {
+    accelBiasX = aSumX / good;
+    accelBiasY = aSumY / good;
+    accelBiasZ = (aSumZ / good) - 1.0f; // take out 1 g of gravity on the vertical axis
+
+    gyroBiasX = gSumX / good;
+    gyroBiasY = gSumY / good;
+    gyroBiasZ = gSumZ / good;
+  }
+
+  float tofSum = 0;
+  int validTofSamples = 0;
+
+  for (int i = 0; i < 10; i++) {
+    if (l0x.isRangeComplete()) {
+      tofSum += l0x.readRange();
+      validTofSamples++;
+    }
+    calibrationProgress = 85 + (i * 15 / 10);
+    server.handleClient();
+    delay(20);
+  }
+
+  if (validTofSamples > 0) {
+    tofOffset = TARGET_GROUND_HEIGHT - (tofSum / validTofSamples);
+  }
+
+  resetEstimator();
+  yawAngle = 0.0f;
+  calibrationProgress = 100;
+  delay(100);
+  isCalibrating = false;
+}
 
